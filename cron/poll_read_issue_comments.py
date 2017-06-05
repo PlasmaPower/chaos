@@ -40,7 +40,8 @@ def insert_or_update(api, cmd_obj):
     comment_id = cmd_obj["global_comment_id"]
     issue, _ = Issue.get_or_create(issue_id=cmd_obj["issue_id"])
     user, _ = User.get_or_create(login=cmd_obj["user"]["login"],
-                                 user_id=cmd_obj["user"]["id"])
+                                 user_id=cmd_obj["user"]["id"],
+                                 defaults={"votes": 0})
 
     comment, _ = Comment.get_or_create(comment_id=comment_id,
                                        user=user, text=cmd_obj["comment_text"],
@@ -92,7 +93,8 @@ def post_command_status_update(api, cmd, has_votes):
         resp = gh.comments.leave_comment(api, settings.URN, cmd.issue.issue_id, body)
 
     user, _ = User.get_or_create(login=resp["user"]["login"],
-                                 user_id=resp["user"]["id"])
+                                 user_id=resp["user"]["id"],
+                                 defaults={"votes": 0})
     resp_comment, _ = Comment.get_or_create(comment_id=resp["id"],
                                             user=user, text=body,
                                             created_at=resp["created_at"],

@@ -16,6 +16,7 @@ class BaseModel(pw.Model):
 class User(BaseModel):
     login = pw.CharField(unique=True)
     user_id = pw.IntegerField(primary_key=True)
+    votes = pw.IntegerField()
 
 
 class Comment(BaseModel):

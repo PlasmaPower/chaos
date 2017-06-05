@@ -10,7 +10,6 @@ import subprocess
 import settings
 import schedule
 import cron
-import shutil
 
 # this import must happen before any github api stuff gets imported.  it sets
 # up caching on the api functions so we don't run out of api requests
@@ -62,10 +61,6 @@ def main():
     logging.getLogger("peewee").propagate = False
 
     log = logging.getLogger("chaosbot")
-
-    if exists("voters.json"):
-        log.info("Moving voters.json to server directory!")
-        shutil.move("./voters.json", "./server/voters.json")
 
     api = gh.API(settings.GITHUB_USER, settings.GITHUB_SECRET)
 

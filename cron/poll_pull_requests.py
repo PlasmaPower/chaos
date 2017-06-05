@@ -3,7 +3,7 @@ import json
 import os
 import sys
 from os.path import join, abspath, dirname
-from lib.db.models import MeritocracyMentioned
+from lib.db.models import MeritocracyMentioned, User
 
 import settings
 import github_api as gh
@@ -22,144 +22,122 @@ def poll_pull_requests(api):
     # get all ready prs (disregarding of the voting window)
     prs = gh.prs.get_ready_prs(api, settings.URN, 0)
 
-    # This sets up a voting record, with each user having a count of votes
-    # that they have cast.
-    try:
-        fp = open('server/voters.json', 'x')
-        fp.close()
-    except:
-        # file already exists, which is what we want
-        pass
+    top_contributors = sorted(gh.repos.get_contributors(api, settings.URN),
+                              key=lambda user: user["total"], reverse=True)
+    top_contributors = [item["author"]["login"].lower() for item in top_contributors]
+    contributors = set(top_contributors)  # store it while it's still a complete list
+    top_contributors = top_contributors[:settings.MERITOCRACY_TOP_CONTRIBUTORS]
+    top_contributors = set(top_contributors)
+    top_voters = (User
+                  .select()
+                  .order_by(User.votes.desc())
+                  .limit(settings.MERITOCRACY_TOP_VOTERS)
+                  .get())
+    top_voters = set(map(lambda voter: voter.username, top_voters))
+    meritocracy = top_voters | top_contributors
+    __log.info("generated meritocracy: " + str(meritocracy))
 
-    with open('server/voters.json', 'r+') as fp:
-        total_votes = {}
-        fs = fp.read()
-        if fs:
-            total_votes = json.loads(fs)
+    with open('server/meritocracy.json', 'w') as mfp:
+        json.dump(list(meritocracy), mfp)
 
-        top_contributors = sorted(gh.repos.get_contributors(api, settings.URN),
-                                  key=lambda user: user["total"], reverse=True)
-        top_contributors = [item["author"]["login"].lower() for item in top_contributors]
-        contributors = set(top_contributors)  # store it while it's still a complete list
-        top_contributors = top_contributors[:settings.MERITOCRACY_TOP_CONTRIBUTORS]
-        top_contributors = set(top_contributors)
-        top_voters = sorted(total_votes, key=total_votes.get, reverse=True)
-        top_voters = map(lambda user: user.lower(), top_voters)
-        top_voters = list(filter(lambda user: user not in settings.MERITOCRACY_VOTERS_BLACKLIST,
-                                 top_voters))
-        top_voters = set(top_voters[:settings.MERITOCRACY_TOP_VOTERS])
-        meritocracy = top_voters | top_contributors
-        __log.info("generated meritocracy: " + str(meritocracy))
+    needs_update = False
+    for pr in prs:
+        pr_num = pr["number"]
+        __log.info("processing PR #%d", pr_num)
 
-        with open('server/meritocracy.json', 'w') as mfp:
-            json.dump(list(meritocracy), mfp)
+        # gather all current votes
+        votes, meritocracy_satisfied = gh.voting.get_votes(api, settings.URN, pr, meritocracy)
 
-        needs_update = False
-        for pr in prs:
-            pr_num = pr["number"]
-            __log.info("processing PR #%d", pr_num)
+        # is our PR approved or rejected?
+        vote_total, variance = gh.voting.get_vote_sum(api, votes, contributors)
+        threshold = gh.voting.get_approval_threshold(api, settings.URN)
+        is_approved = vote_total >= threshold and meritocracy_satisfied
 
-            # gather all current votes
-            votes, meritocracy_satisfied = gh.voting.get_votes(api, settings.URN, pr, meritocracy)
+        seconds_since_updated = gh.prs.seconds_since_updated(api, pr)
 
-            # is our PR approved or rejected?
-            vote_total, variance = gh.voting.get_vote_sum(api, votes, contributors)
-            threshold = gh.voting.get_approval_threshold(api, settings.URN)
-            is_approved = vote_total >= threshold and meritocracy_satisfied
+        voting_window = base_voting_window
+        # the PR is mitigated or the threshold is not reached ?
+        if variance >= threshold or not is_approved:
+            voting_window = gh.voting.get_extended_voting_window(api, settings.URN)
+            if (settings.IN_PRODUCTION and vote_total >= threshold / 2 and
+                    seconds_since_updated > base_voting_window and not meritocracy_satisfied):
+                # check if we need to mention the meritocracy
+                try:
+                    commit = pr["head"]["sha"]
 
-            seconds_since_updated = gh.prs.seconds_since_updated(api, pr)
+                    mm, created = MeritocracyMentioned.get_or_create(commit_hash=commit)
+                    if created:
+                        meritocracy_mentions = meritocracy - {pr["user"]["login"].lower(),
+                                                              "chaosbot"}
+                        gh.comments.leave_meritocracy_comment(api, settings.URN, pr["number"],
+                                                              meritocracy_mentions)
+                except:
+                    __log.exception("Failed to process meritocracy mention")
 
-            voting_window = base_voting_window
-            # the PR is mitigated or the threshold is not reached ?
-            if variance >= threshold or not is_approved:
-                voting_window = gh.voting.get_extended_voting_window(api, settings.URN)
-                if (settings.IN_PRODUCTION and vote_total >= threshold / 2 and
-                        seconds_since_updated > base_voting_window and not meritocracy_satisfied):
-                    # check if we need to mention the meritocracy
-                    try:
-                        commit = pr["head"]["sha"]
+        # is our PR in voting window?
+        in_window = seconds_since_updated > voting_window
 
-                        mm, created = MeritocracyMentioned.get_or_create(commit_hash=commit)
-                        if created:
-                            meritocracy_mentions = meritocracy - {pr["user"]["login"].lower(),
-                                                                  "chaosbot"}
-                            gh.comments.leave_meritocracy_comment(api, settings.URN, pr["number"],
-                                                                  meritocracy_mentions)
-                    except:
-                        __log.exception("Failed to process meritocracy mention")
+        if is_approved:
+            __log.info("PR %d status: will be approved", pr_num)
 
-            # is our PR in voting window?
-            in_window = seconds_since_updated > voting_window
+            gh.prs.post_accepted_status(
+                api, settings.URN, pr, seconds_since_updated, voting_window, votes, vote_total,
+                threshold, meritocracy_satisfied)
 
-            if is_approved:
-                __log.info("PR %d status: will be approved", pr_num)
+            if in_window:
+                __log.info("PR %d approved for merging!", pr_num)
 
-                gh.prs.post_accepted_status(
-                    api, settings.URN, pr, seconds_since_updated, voting_window, votes, vote_total,
+                try:
+                    sha = gh.prs.merge_pr(api, settings.URN, pr, votes, vote_total,
+                                          threshold, meritocracy_satisfied)
+                # some error, like suddenly there's a merge conflict, or some
+                # new commits were introduced between finding this ready pr and
+                # merging it
+                except gh.exceptions.CouldntMerge:
+                    __log.info("couldn't merge PR %d for some reason, skipping",
+                               pr_num)
+                    gh.issues.label_issue(api, settings.URN, pr_num, ["can't merge"])
+                    continue
+
+                gh.comments.leave_accept_comment(
+                    api, settings.URN, pr_num, sha, votes, vote_total,
                     threshold, meritocracy_satisfied)
+                gh.issues.label_issue(api, settings.URN, pr_num, ["accepted"])
 
-                if in_window:
-                    __log.info("PR %d approved for merging!", pr_num)
+                # chaosbot rewards merge owners with a follow
+                pr_owner = pr["user"]["login"]
+                gh.users.follow_user(api, pr_owner)
 
-                    try:
-                        sha = gh.prs.merge_pr(api, settings.URN, pr, votes, vote_total,
-                                              threshold, meritocracy_satisfied)
-                    # some error, like suddenly there's a merge conflict, or some
-                    # new commits were introduced between finding this ready pr and
-                    # merging it
-                    except gh.exceptions.CouldntMerge:
-                        __log.info("couldn't merge PR %d for some reason, skipping",
-                                   pr_num)
-                        gh.issues.label_issue(api, settings.URN, pr_num, ["can't merge"])
-                        continue
+                needs_update = True
 
-                    gh.comments.leave_accept_comment(
-                        api, settings.URN, pr_num, sha, votes, vote_total,
-                        threshold, meritocracy_satisfied)
-                    gh.issues.label_issue(api, settings.URN, pr_num, ["accepted"])
+        else:
+            __log.info("PR %d status: will be rejected", pr_num)
 
-                    # chaosbot rewards merge owners with a follow
-                    pr_owner = pr["user"]["login"]
-                    gh.users.follow_user(api, pr_owner)
-
-                    needs_update = True
-
+            if in_window:
+                gh.prs.post_rejected_status(
+                    api, settings.URN, pr, seconds_since_updated, voting_window, votes,
+                    vote_total, threshold, meritocracy_satisfied)
+                __log.info("PR %d rejected, closing", pr_num)
+                gh.comments.leave_reject_comment(
+                    api, settings.URN, pr_num, votes, vote_total, threshold,
+                    meritocracy_satisfied)
+                gh.issues.label_issue(api, settings.URN, pr_num, ["rejected"])
+                gh.prs.close_pr(api, settings.URN, pr)
+            elif vote_total < 0:
+                gh.prs.post_rejected_status(
+                    api, settings.URN, pr, seconds_since_updated, voting_window, votes,
+                    vote_total, threshold, meritocracy_satisfied)
             else:
-                __log.info("PR %d status: will be rejected", pr_num)
+                gh.prs.post_pending_status(
+                    api, settings.URN, pr, seconds_since_updated, voting_window, votes,
+                    vote_total, threshold, meritocracy_satisfied)
 
-                if in_window:
-                    gh.prs.post_rejected_status(
-                        api, settings.URN, pr, seconds_since_updated, voting_window, votes,
-                        vote_total, threshold, meritocracy_satisfied)
-                    __log.info("PR %d rejected, closing", pr_num)
-                    gh.comments.leave_reject_comment(
-                        api, settings.URN, pr_num, votes, vote_total, threshold,
-                        meritocracy_satisfied)
-                    gh.issues.label_issue(api, settings.URN, pr_num, ["rejected"])
-                    gh.prs.close_pr(api, settings.URN, pr)
-                elif vote_total < 0:
-                    gh.prs.post_rejected_status(
-                        api, settings.URN, pr, seconds_since_updated, voting_window, votes,
-                        vote_total, threshold, meritocracy_satisfied)
-                else:
-                    gh.prs.post_pending_status(
-                        api, settings.URN, pr, seconds_since_updated, voting_window, votes,
-                        vote_total, threshold, meritocracy_satisfied)
-
-            for user in votes:
-                if user in total_votes:
-                    total_votes[user] += 1
-                else:
-                    total_votes[user] = 1
-
-        if fs:
-            # prepare for overwriting
-            fp.seek(0)
-            fp.truncate()
-        json.dump(total_votes, fp)
-
-        # flush all buffers because we might restart, which could cause a crash
-        os.fsync(fp)
+        for username in votes:
+            # TODO keep track of user ID
+            user, created = User.get_or_create(login=username, defaults={"votes": 1})
+            if not created:
+                user.votes += 1
+                user.save()
 
     # we approved a PR, restart
     if needs_update:
